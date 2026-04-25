@@ -4,7 +4,6 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2011-0078D4?style=flat-square&logo=windows&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)
 
 ---
 
@@ -143,8 +142,3 @@ The process list auto-refreshes every **5 seconds**. Only CPU% and RAM values up
 
 Both install automatically via `run.bat`.
 
----
-
-## License
-
-MIT
