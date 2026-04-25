@@ -295,6 +295,60 @@ KNOWN_PROCESSES: dict[str, tuple[str, str]] = {
     "anki.exe":                       ("other", "Anki — spaced repetition flashcards"),
 }
 
+# Processes recommended to kill — unnecessary background resource consumers
+BLOAT_PROCESSES: frozenset[str] = frozenset({
+    # Windows telemetry — phone-home services that spike CPU/disk while idle
+    "compattelrunner.exe",    # Compatibility Telemetry Runner
+    "wsappx.exe",             # Windows Store diagnostics / AppX deployment worker
+    "usoclient.exe",          # Update Session Orchestrator — triggers update scans
+    "musnotifyicon.exe",      # Windows Update notification tray icon
+    "tiworker.exe",           # Trusted Installer Worker — notorious for HDD thrashing
+    "wuauclt.exe",            # Windows Update client
+    "diaghost.exe",           # Diagnostic host
+    # NVIDIA bloat
+    "nvtelemetry.exe",        # NVIDIA Telemetry Container — pure data collection
+    # Gaming launchers (huge memory footprint when idle)
+    "epicgameslauncher.exe",  # Epic Games Launcher — notorious RAM hog
+    "steamwebhelper.exe",     # Steam built-in browser (overlay)
+    "gamebar.exe",            # Xbox Game Bar
+    "gamebarft.exe",          # Xbox Game Bar feature tool
+    # Microsoft background bloat
+    "cortana.exe",            # Cortana — rarely used, always running
+    "officeclicktorun.exe",   # Office Click-to-Run background updater
+    "searchindexer.exe",      # Windows Search Indexer — heavy on HDDs
+    "msedgewebview2.exe",     # Edge WebView2 — embedded browser running for no reason
+})
+
+# Processes where killing may cause data loss or break functionality
+CAUTION_PROCESSES: frozenset[str] = frozenset({
+    # Office apps — unsaved work will be lost
+    "winword.exe", "excel.exe", "powerpnt.exe", "onenote.exe", "msaccess.exe",
+    # Databases — abrupt kill may corrupt data
+    "mysqld.exe", "postgres.exe", "mongod.exe", "redis-server.exe",
+    # Container / VM engines
+    "dockerd.exe", "com.docker.backend.exe", "vmplayer.exe",
+    # Java — unknown app, could be anything critical
+    "java.exe", "javaw.exe",
+})
+
+
+def get_kill_rating(proc: ProcessInfo) -> tuple[str, str, str]:
+    """Return (level, label, color) describing how safe/recommended killing this process is."""
+    name = proc.name.lower()
+    # System and security are always dangerous to kill
+    if proc.category in ("system", "security"):
+        return ("risky",   "⛔ Risky",   "red")
+    # Processes with known data-loss risk
+    if name in CAUTION_PROCESSES:
+        return ("caution", "⚠ Caution",  "yellow")
+    # Known bloat — actively recommend killing
+    if name in BLOAT_PROCESSES:
+        return ("bloat",   "★ Kill it",  "bright_green")
+    # Java runtime default caution
+    if proc.category == "runtime":
+        return ("caution", "⚠ Caution",  "yellow")
+    return ("safe",    "✓ Safe",    "green")
+
 
 # ── Windows PE version info reader ───────────────────────────────────────────
 
@@ -743,9 +797,11 @@ class ProcessKillerApp(App):
         "PID": ("pid", True),
         "Process Name": ("name", False),
         "Category": ("category", False),
+        "Safety": ("safety", True),
         "CPU %": ("cpu", True),
         "RAM MB": ("ram", True),
     }
+    _SAFETY_ORDER = {"bloat": 3, "safe": 2, "caution": 1, "risky": 0}
 
     def __init__(self) -> None:
         super().__init__()
@@ -765,9 +821,9 @@ class ProcessKillerApp(App):
 
     def on_mount(self) -> None:
         t = self.query_one(DataTable)
-        cols = t.add_columns("PID", "Process Name", "Category", "Description", "CPU %", "RAM MB", "Status")
-        self._col_cpu = cols[4]
-        self._col_ram = cols[5]
+        cols = t.add_columns("PID", "Process Name", "Category", "Safety", "Description", "CPU %", "RAM MB", "Status")
+        self._col_cpu = cols[5]
+        self._col_ram = cols[6]
         self._load()
         self.set_interval(5, self._background_refresh)
 
@@ -810,14 +866,18 @@ class ProcessKillerApp(App):
         if q:
             procs = [
                 p for p in procs
-                if q in p.name.lower() or q in p.description.lower() or q in p.category.lower()
+                if q in p.name.lower()
+                or q in p.description.lower()
+                or q in p.category.lower()
+                or q in get_kill_rating(p)[1].lower()
             ]
         key_fn = {
-            "pid":  lambda p: p.pid,
-            "name": lambda p: p.name.lower(),
+            "pid":    lambda p: p.pid,
+            "name":   lambda p: p.name.lower(),
             "category": lambda p: p.category,
-            "cpu":  lambda p: p.cpu_percent,
-            "ram":  lambda p: p.memory_mb,
+            "safety": lambda p: self._SAFETY_ORDER[get_kill_rating(p)[0]],
+            "cpu":    lambda p: p.cpu_percent,
+            "ram":    lambda p: p.memory_mb,
         }.get(self._sort_key, lambda p: p.memory_mb)
         return sorted(procs, key=key_fn, reverse=self._sort_rev)
 
@@ -844,6 +904,9 @@ class ProcessKillerApp(App):
 
             cat_t = Text(f"{cat.icon}  {cat.name}", style=cat.color)
 
+            _level, _label, _color = get_kill_rating(p)
+            safety_t = Text(_label, style=f"bold {_color}" if _level in ("bloat", "risky") else _color)
+
             cpu_s = f"{p.cpu_percent:5.1f}"
             cpu_t = Text(cpu_s, style="bold red" if p.cpu_percent > 20 else "yellow" if p.cpu_percent > 5 else "green")
 
@@ -855,7 +918,7 @@ class ProcessKillerApp(App):
                 desc = desc[:57] + "…"
 
             t.add_row(
-                str(p.pid), name_t, cat_t, desc, cpu_t, ram_t, p.status,
+                str(p.pid), name_t, cat_t, safety_t, desc, cpu_t, ram_t, p.status,
                 key=str(p.pid),
             )
 
