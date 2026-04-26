@@ -1,4 +1,4 @@
-# Windows Process Explainer
+# Windows Process Killer
 
 > A terminal UI for scanning, understanding, and killing Windows processes — without the noise of Task Manager.
 

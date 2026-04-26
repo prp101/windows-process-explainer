@@ -1,11 +1,13 @@
 @echo off
 setlocal
 
+cd /d "%~dp0"
+
 if not exist ".venv" (
     echo [setup] Creating virtual environment...
     python -m venv .venv
     if errorlevel 1 (
-        echo ERROR: python not found. Install from https://python.org
+        echo ERROR: python not found. Install Python from https://python.org
         pause
         exit /b 1
     )

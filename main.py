@@ -10,6 +10,8 @@ import asyncio
 import datetime
 import json
 import re
+import subprocess
+import winreg
 import html as _html
 import urllib.request
 import urllib.error
@@ -332,6 +334,20 @@ CAUTION_PROCESSES: frozenset[str] = frozenset({
 })
 
 
+# Pre-built set of known system/security process names.
+# For these we skip expensive psutil calls (memory_info, cpu_percent, exe)
+# because they always fail with AccessDenied — and each failure triggers a
+# Windows security audit IPC that can cost 30-100 ms per call.
+_PROTECTED_NAMES: frozenset[str] = frozenset(
+    name for name, (cat, _) in KNOWN_PROCESSES.items()
+    if cat in ("system", "security")
+)
+
+# Caches so repeat scans don't redo work
+_CATEGORIZE_CACHE: dict[str, tuple[str, str]] = {}
+_VERSION_INFO_CACHE: dict[str, dict[str, str]] = {}
+
+
 def get_kill_rating(proc: ProcessInfo) -> tuple[str, str, str]:
     """Return (level, label, color) describing how safe/recommended killing this process is."""
     name = proc.name.lower()
@@ -354,6 +370,8 @@ def get_kill_rating(proc: ProcessInfo) -> tuple[str, str, str]:
 
 def _get_version_info(path: str) -> dict[str, str]:
     """Read string fields from a Windows PE executable's version info block."""
+    if path in _VERSION_INFO_CACHE:
+        return _VERSION_INFO_CACHE[path]
     result: dict[str, str] = {}
     try:
         ver = ctypes.windll.version
@@ -386,6 +404,7 @@ def _get_version_info(path: str) -> dict[str, str]:
                         result[field] = val
     except Exception:
         pass
+    _VERSION_INFO_CACHE[path] = result
     return result
 
 
@@ -411,7 +430,10 @@ def _categorize(name: str, exe: Optional[str]) -> tuple[str, str]:
     key = name.lower()
     if key in KNOWN_PROCESSES:
         return KNOWN_PROCESSES[key]
-    # Try Windows version info for unknown processes
+    cache_key = exe or name
+    if cache_key in _CATEGORIZE_CACHE:
+        return _CATEGORIZE_CACHE[cache_key]
+    result: tuple[str, str]
     if exe and os.path.exists(exe):
         desc = _get_version_info(exe).get("FileDescription")
         if desc:
@@ -424,9 +446,16 @@ def _categorize(name: str, exe: Optional[str]) -> tuple[str, str]:
                 ("microsoft", "microsoft"),
             ]:
                 if kw in d:
-                    return (cat, desc)
-            return ("other", desc)
-    return ("other", "Unknown process")
+                    result = (cat, desc)
+                    break
+            else:
+                result = ("other", desc)
+        else:
+            result = ("other", "Unknown process")
+    else:
+        result = ("other", "Unknown process")
+    _CATEGORIZE_CACHE[cache_key] = result
+    return result
 
 
 def scan_processes() -> list[ProcessInfo]:
@@ -436,27 +465,217 @@ def scan_processes() -> list[ProcessInfo]:
             with proc.oneshot():
                 pid = proc.pid
                 name = proc.name()
-                status = proc.status()
-                try:
-                    exe: Optional[str] = proc.exe()
-                except (psutil.AccessDenied, psutil.NoSuchProcess):
-                    exe = None
-                try:
-                    mem = proc.memory_info().rss / (1024 * 1024)
-                except (psutil.AccessDenied, psutil.NoSuchProcess):
-                    mem = 0.0
-                try:
-                    cpu = proc.cpu_percent(interval=None)
-                except (psutil.AccessDenied, psutil.NoSuchProcess):
-                    cpu = 0.0
+                if not name:
+                    continue
+                # Skip expensive OpenProcess calls for known system/security processes.
+                # Each failed call triggers a Windows security audit IPC (~30-100 ms each).
+                if name.lower() in _PROTECTED_NAMES:
+                    exe, mem, cpu = None, 0.0, 0.0
+                else:
+                    try:
+                        exe: Optional[str] = proc.exe()
+                    except (psutil.AccessDenied, psutil.NoSuchProcess):
+                        exe = None
+                    try:
+                        mem = proc.memory_info().rss / (1024 * 1024)
+                    except (psutil.AccessDenied, psutil.NoSuchProcess):
+                        mem = 0.0
+                    try:
+                        cpu = proc.cpu_percent(interval=None)
+                    except (psutil.AccessDenied, psutil.NoSuchProcess):
+                        cpu = 0.0
                 category, description = _categorize(name, exe)
                 result.append(ProcessInfo(
                     pid=pid, name=name, category=category, description=description,
-                    cpu_percent=cpu, memory_mb=mem, exe=exe, status=status,
+                    cpu_percent=cpu, memory_mb=mem, exe=exe, status="",
                 ))
         except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
             continue
     return result
+
+
+# ── Startup-mechanism detection & blocking ────────────────────────────────────
+
+@dataclass
+class StartupEntry:
+    kind: str        # "service" | "registry" | "task"
+    label: str       # human-readable description shown in UI
+    detail: str      # technical id: service name, reg value name, task path
+    extra: dict      # kind-specific data needed for disable
+
+
+_RUN_KEYS = [
+    (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",     "HKCU Run"),
+    (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",     "HKLM Run"),
+    (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", "HKCU RunOnce"),
+    (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", "HKLM RunOnce"),
+]
+
+
+def _check_services(pid: int, exe_name: str) -> list[StartupEntry]:
+    entries: list[StartupEntry] = []
+    # Check running services by PID (fastest path)
+    try:
+        for svc in psutil.win_service_iter():
+            try:
+                if svc.pid() == pid:
+                    info = svc.as_dict()
+                    if info.get("start_type") != "disabled":
+                        entries.append(StartupEntry(
+                            kind="service",
+                            label=f"Windows Service — {info.get('display_name', svc.name())}",
+                            detail=svc.name(),
+                            extra={},
+                        ))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    if entries:
+        return entries
+    # Fallback: scan registry for any service whose ImagePath mentions this exe
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SYSTEM\CurrentControlSet\Services") as root:
+            i = 0
+            while True:
+                try:
+                    svc_name = winreg.EnumKey(root, i); i += 1
+                    with winreg.OpenKey(root, svc_name) as sk:
+                        try:
+                            img, _ = winreg.QueryValueEx(sk, "ImagePath")
+                            if exe_name in img.lower():
+                                start, _ = winreg.QueryValueEx(sk, "Start")
+                                if start != 4:  # 4 = disabled
+                                    try:
+                                        display, _ = winreg.QueryValueEx(sk, "DisplayName")
+                                        if display.startswith("@"):
+                                            display = svc_name
+                                    except OSError:
+                                        display = svc_name
+                                    entries.append(StartupEntry(
+                                        kind="service",
+                                        label=f"Windows Service — {display}",
+                                        detail=svc_name,
+                                        extra={},
+                                    ))
+                        except OSError:
+                            pass
+                except OSError:
+                    break
+    except Exception:
+        pass
+    return entries
+
+
+def _check_registry(exe_name: str, exe_path: str) -> list[StartupEntry]:
+    entries: list[StartupEntry] = []
+    for hive, key_path, label in _RUN_KEYS:
+        try:
+            with winreg.OpenKey(hive, key_path, access=winreg.KEY_READ) as key:
+                i = 0
+                while True:
+                    try:
+                        name, value, _ = winreg.EnumValue(key, i); i += 1
+                        v = value.lower()
+                        if exe_name in v or (exe_path and exe_path in v):
+                            entries.append(StartupEntry(
+                                kind="registry",
+                                label=f"Registry autostart ({label}): {name}",
+                                detail=name,
+                                extra={"hive": hive, "key_path": key_path},
+                            ))
+                    except OSError:
+                        break
+        except (FileNotFoundError, PermissionError, OSError):
+            pass
+    return entries
+
+
+def _check_tasks(exe_name: str) -> list[StartupEntry]:
+    entries: list[StartupEntry] = []
+    try:
+        ps = (
+            f'$n="{exe_name}";'
+            '$t=Get-ScheduledTask|Where-Object{$_.Actions|Where-Object{$_.Execute -like "*$n*"}};'
+            'if($t){$t|Select-Object TaskName,TaskPath|ConvertTo-Json -Compress}'
+        )
+        r = subprocess.run(
+            ["powershell", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=8,
+        )
+        if r.stdout.strip():
+            data = json.loads(r.stdout.strip())
+            if isinstance(data, dict):
+                data = [data]
+            for task in data:
+                path = (task.get("TaskPath") or "\\") + (task.get("TaskName") or "")
+                entries.append(StartupEntry(
+                    kind="task",
+                    label=f"Scheduled Task: {task.get('TaskName', path)}",
+                    detail=path,
+                    extra={},
+                ))
+    except Exception:
+        pass
+    return entries
+
+
+def find_startup_entries(proc: ProcessInfo) -> list[StartupEntry]:
+    """Find all mechanisms that could start/restart this process."""
+    exe = proc.exe or proc.name
+    exe_name = os.path.basename(exe).lower()
+    exe_path = exe.lower()
+    entries: list[StartupEntry] = []
+    entries += _check_services(proc.pid, exe_name)
+    entries += _check_registry(exe_name, exe_path)
+    entries += _check_tasks(exe_name)
+    # Deduplicate by (kind, detail)
+    seen: set[tuple[str, str]] = set()
+    unique = []
+    for e in entries:
+        key = (e.kind, e.detail)
+        if key not in seen:
+            seen.add(key)
+            unique.append(e)
+    return unique
+
+
+def disable_startup_entry(entry: StartupEntry) -> tuple[bool, str]:
+    """Disable a startup entry. Returns (success, message)."""
+    try:
+        if entry.kind == "service":
+            subprocess.run(["sc", "stop", entry.detail], capture_output=True, timeout=5)
+            r = subprocess.run(
+                ["sc", "config", entry.detail, "start=", "disabled"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                return True, f"Service '{entry.detail}' disabled"
+            return False, "sc config failed — run as Administrator"
+
+        elif entry.kind == "registry":
+            hive = entry.extra["hive"]
+            key_path = entry.extra["key_path"]
+            with winreg.OpenKey(hive, key_path, access=winreg.KEY_SET_VALUE) as k:
+                winreg.DeleteValue(k, entry.detail)
+            return True, f"Removed autostart key '{entry.detail}'"
+
+        elif entry.kind == "task":
+            task_name = entry.detail.lstrip("\\")
+            r = subprocess.run(
+                ["schtasks", "/Change", "/TN", task_name, "/DISABLE"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                return True, f"Task '{task_name}' disabled"
+            return False, "schtasks failed — run as Administrator"
+
+    except PermissionError:
+        return False, "Access denied — run as Administrator"
+    except Exception as e:
+        return False, str(e)
+    return False, "Unknown error"
 
 
 def get_process_details(p: ProcessInfo) -> dict:
@@ -735,6 +954,85 @@ class ProcessDetailScreen(ModalScreen):
         self.dismiss()
 
 
+# ── Block (kill + prevent restart) modal ─────────────────────────────────────
+
+class BlockScreen(ModalScreen):
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter",  "confirm", "Block"),
+    ]
+
+    def __init__(self, proc: ProcessInfo) -> None:
+        super().__init__()
+        self.proc = proc
+        self._entries: list[StartupEntry] = []
+
+    def compose(self) -> ComposeResult:
+        yield Container(
+            Static(id="block-body"),
+            Horizontal(
+                Button("Kill & Block  [Enter]", id="btn-block", variant="error"),
+                Button("Cancel  [Esc]", id="btn-cancel"),
+                id="block-footer",
+            ),
+            id="block-box",
+        )
+
+    def on_mount(self) -> None:
+        cat = CATEGORIES[self.proc.category]
+        self.query_one("#block-body", Static).update(
+            f"[bold]{self.proc.name}[/bold]  [{cat.color}]{cat.icon} {cat.name}[/{cat.color}]"
+            f"  PID [cyan]{self.proc.pid}[/cyan]\n\n"
+            f"[dim]  Scanning for startup mechanisms…[/dim]"
+        )
+        self.run_worker(self._scan(), exclusive=False)
+
+    async def _scan(self) -> None:
+        entries = await asyncio.to_thread(find_startup_entries, self.proc)
+        self._entries = entries
+        cat = CATEGORIES[self.proc.category]
+        lines: list[str] = [
+            f"[bold]{self.proc.name}[/bold]  [{cat.color}]{cat.icon} {cat.name}[/{cat.color}]"
+            f"  PID [cyan]{self.proc.pid}[/cyan]",
+            "",
+        ]
+        if entries:
+            lines.append(f"[bold]Found {len(entries)} startup mechanism{'s' if len(entries) != 1 else ''}:[/bold]")
+            lines.append("")
+            for e in entries:
+                icon = {"service": "⚙", "registry": "🔑", "task": "⏰"}.get(e.kind, "◆")
+                lines.append(f"  [yellow]{icon}[/yellow]  {e.label}")
+            lines.append("")
+            lines.append("[dim]  Kill & Block will terminate the process and disable all[/dim]")
+            lines.append("[dim]  of the above so it cannot start again automatically.[/dim]")
+        else:
+            lines += [
+                "[yellow]No startup mechanisms found.[/yellow]",
+                "",
+                "This process is not registered as a Windows service,",
+                "has no registry autostart entry, and no scheduled task.",
+                "",
+                "[dim]  It may be launched by another process or application.[/dim]",
+                "[dim]  Kill & Block will only terminate the current instance.[/dim]",
+            ]
+        lines += ["", "[dim]  [bold]Enter[/bold] confirm    [bold]Esc[/bold] cancel[/dim]"]
+        try:
+            self.query_one("#block-body", Static).update("\n".join(lines))
+            btn = self.query_one("#btn-block", Button)
+            btn.label = ("Kill & Block  [Enter]" if entries else "Kill  [Enter]")
+        except Exception:
+            pass
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(self._entries if event.button.id == "btn-block" else None)
+
+    def action_confirm(self) -> None:
+        self.dismiss(self._entries)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # ── Main app ──────────────────────────────────────────────────────────────────
 
 class ProcessKillerApp(App):
@@ -751,7 +1049,7 @@ class ProcessKillerApp(App):
         border-bottom: tall $primary;
     }
     #search-input { width: 1fr; }
-    #stats { width: auto; padding: 0 2; content-align: right middle; color: $text-muted; }
+    #stats { width: 38; padding: 0 2; content-align: right middle; color: $text-muted; }
 
     DataTable { height: 1fr; }
 
@@ -778,11 +1076,25 @@ class ProcessKillerApp(App):
     #detail-scroll { height: 1fr; }
     #detail-footer { height: 3; align: center middle; padding-top: 1; }
     #detail-footer Button { margin: 0 1; }
+
+    BlockScreen { align: center middle; }
+    #block-box {
+        width: 72;
+        height: auto;
+        max-height: 36;
+        background: $surface;
+        border: thick $warning;
+        padding: 1 2 0 2;
+    }
+    #block-body { height: auto; }
+    #block-footer { height: 3; align: center middle; padding-top: 1; }
+    #block-footer Button { margin: 0 1; }
     """
 
     BINDINGS = [
         Binding("k",       "kill",          "Kill",    show=True),
         Binding("delete",  "kill",          "Kill",    show=False),
+        Binding("b",       "block",         "Block",   show=True),
         Binding("e",       "expand",        "Expand",  show=True),
         Binding("r",       "refresh",       "Refresh", show=True),
         Binding("ctrl+r",  "refresh",       "Refresh", show=False),
@@ -816,49 +1128,36 @@ class ProcessKillerApp(App):
         with Horizontal(id="search-bar"):
             yield Input(placeholder="Filter by name, category, description…  (press /)", id="search-input")
             yield Label("", id="stats")
-        yield DataTable(cursor_type="row", id="table", zebra_stripes=True)
+        yield DataTable(cursor_type="row", id="table", zebra_stripes=True, show_row_labels=False)
         yield Footer()
 
     def on_mount(self) -> None:
         t = self.query_one(DataTable)
-        cols = t.add_columns("PID", "Process Name", "Category", "Safety", "Description", "CPU %", "RAM MB", "Status")
-        self._col_cpu = cols[5]
-        self._col_ram = cols[6]
-        self._load()
-        self.set_interval(5, self._background_refresh)
+        # Explicit widths stop Textual scanning all rows to auto-measure columns on scroll.
+        ck = [
+            t.add_column("PID",          width=7),
+            t.add_column("Process Name", width=26),
+            t.add_column("Category",     width=16),
+            t.add_column("Safety",       width=12),
+            t.add_column("Description",  width=44),
+            t.add_column("CPU %",        width=7),
+            t.add_column("RAM MB",       width=9),
+        ]
+        self._col_cpu = ck[5]
+        self._col_ram = ck[6]
+        self.set_interval(30, self._background_refresh)
+        self.run_worker(self._load(), exclusive=True, name="load")
 
     # ── Data loading ──────────────────────────────────────────────────────────
 
-    def _load(self) -> None:
-        self._processes = scan_processes()
+    async def _load(self) -> None:
+        self.query_one("#stats", Label).update("  [dim]Scanning…[/dim]")
+        self._processes = await asyncio.to_thread(scan_processes)
         self._render_table()
 
     async def _background_refresh(self) -> None:
-        """Update CPU/RAM values in-place — no table rebuild, no scroll jump."""
-        # Run the blocking psutil scan off the event loop so scrolling stays responsive
-        new_procs = await asyncio.to_thread(scan_processes)
-        self._processes = new_procs
-        pid_map = {p.pid: p for p in new_procs}
-        t = self.query_one(DataTable)
-        for i, rk in enumerate(list(t.rows.keys())):
-            try:
-                p = pid_map.get(int(rk.value))
-                if not p:
-                    continue
-                cpu_t = Text(
-                    f"{p.cpu_percent:5.1f}",
-                    style="bold red" if p.cpu_percent > 20 else "yellow" if p.cpu_percent > 5 else "green",
-                )
-                ram_t = Text(
-                    f"{p.memory_mb:8.1f}",
-                    style="bold red" if p.memory_mb > 500 else "yellow" if p.memory_mb > 100 else "white",
-                )
-                t.update_cell(rk, self._col_cpu, cpu_t, update_width=False)
-                t.update_cell(rk, self._col_ram, ram_t, update_width=False)
-            except Exception:
-                pass
-            if i % 30 == 29:
-                await asyncio.sleep(0)  # yield to event loop every 30 rows
+        """Silently refresh process data — zero UI work, zero scroll stutter."""
+        self._processes = await asyncio.to_thread(scan_processes)
 
     def _visible(self) -> list[ProcessInfo]:
         q = self.filter_text.lower().strip()
@@ -879,7 +1178,12 @@ class ProcessKillerApp(App):
             "cpu":    lambda p: p.cpu_percent,
             "ram":    lambda p: p.memory_mb,
         }.get(self._sort_key, lambda p: p.memory_mb)
-        return sorted(procs, key=key_fn, reverse=self._sort_rev)
+        result = sorted(procs, key=key_fn, reverse=self._sort_rev)
+        # Cap unfiltered view — DataTable O(n) scroll work becomes noticeable above ~250 rows.
+        # Search always shows all matches regardless of cap.
+        if not self.filter_text.strip():
+            result = result[:100]
+        return result
 
     def _render_table(self, keep_cursor: bool = False) -> None:
         t = self.query_one(DataTable)
@@ -892,38 +1196,42 @@ class ProcessKillerApp(App):
             except (IndexError, Exception):
                 pass
 
-        t.clear()
         procs = self._visible()
 
-        for p in procs:
-            cat = CATEGORIES[p.category]
+        with self.batch_update():
+            t.clear()
+            for p in procs:
+                cat = CATEGORIES[p.category]
 
-            name_t = Text(p.name)
-            if not p.safe_to_kill:
-                name_t.stylize("dim italic")
+                name_t = Text(p.name)
+                if not p.safe_to_kill:
+                    name_t.stylize("dim italic")
 
-            cat_t = Text(f"{cat.icon}  {cat.name}", style=cat.color)
+                cat_t = Text(f"{cat.icon}  {cat.name}", style=cat.color)
 
-            _level, _label, _color = get_kill_rating(p)
-            safety_t = Text(_label, style=f"bold {_color}" if _level in ("bloat", "risky") else _color)
+                _level, _label, _color = get_kill_rating(p)
+                safety_t = Text(_label, style=f"bold {_color}" if _level in ("bloat", "risky") else _color)
 
-            cpu_s = f"{p.cpu_percent:5.1f}"
-            cpu_t = Text(cpu_s, style="bold red" if p.cpu_percent > 20 else "yellow" if p.cpu_percent > 5 else "green")
+                cpu_s = f"{p.cpu_percent:5.1f}"
+                cpu_t = Text(cpu_s, style="bold red" if p.cpu_percent > 20 else "yellow" if p.cpu_percent > 5 else "green")
 
-            ram_s = f"{p.memory_mb:8.1f}"
-            ram_t = Text(ram_s, style="bold red" if p.memory_mb > 500 else "yellow" if p.memory_mb > 100 else "white")
+                ram_s = f"{p.memory_mb:8.1f}"
+                ram_t = Text(ram_s, style="bold red" if p.memory_mb > 500 else "yellow" if p.memory_mb > 100 else "white")
 
-            desc = p.description
-            if len(desc) > 58:
-                desc = desc[:57] + "…"
+                desc = p.description
+                if len(desc) > 58:
+                    desc = desc[:57] + "…"
 
-            t.add_row(
-                str(p.pid), name_t, cat_t, safety_t, desc, cpu_t, ram_t, p.status,
-                key=str(p.pid),
-            )
+                t.add_row(
+                    str(p.pid), name_t, cat_t, safety_t, desc, cpu_t, ram_t,
+                    key=str(p.pid),
+                )
 
         label = self.query_one("#stats", Label)
-        label.update(f"  {len(procs)} / {len(self._processes)} processes")
+        total = len(self._processes)
+        shown = len(procs)
+        cap_note = "  [dim](/ to search all)[/dim]" if shown == 100 and not self.filter_text.strip() else ""
+        label.update(f"  {shown} / {total} processes{cap_note}")
 
         if old_pid:
             try:
@@ -963,9 +1271,41 @@ class ProcessKillerApp(App):
                 )
             except Exception as e:
                 self.notify(f"Kill failed: {e}", severity="error")
-            self._load()
+            self.run_worker(self._load(), exclusive=True, name="load")
 
         self.push_screen(ConfirmKillScreen(proc), _after_confirm)
+
+    def action_block(self) -> None:
+        t = self.query_one(DataTable)
+        if not t.row_count:
+            return
+        try:
+            pid = int(list(t.rows.keys())[t.cursor_row].value)
+        except (IndexError, ValueError, Exception):
+            return
+        proc = next((p for p in self._processes if p.pid == pid), None)
+        if not proc:
+            self.notify("Process not found", severity="warning")
+            return
+
+        def _after_block(entries: Optional[list[StartupEntry]]) -> None:
+            if entries is None:
+                return  # cancelled
+            msgs: list[str] = []
+            try:
+                psutil.Process(proc.pid).kill()
+                msgs.append(f"Killed {proc.name}")
+            except psutil.NoSuchProcess:
+                msgs.append(f"{proc.name} already exited")
+            except psutil.AccessDenied:
+                msgs.append("Kill denied — run as Administrator")
+            for entry in entries:
+                ok, msg = disable_startup_entry(entry)
+                msgs.append(("✓ " if ok else "✗ ") + msg)
+            self.notify("  ·  ".join(msgs), timeout=7)
+            self.run_worker(self._load(), exclusive=True, name="load")
+
+        self.push_screen(BlockScreen(proc), _after_block)
 
     def action_expand(self) -> None:
         t = self.query_one(DataTable)
@@ -980,7 +1320,7 @@ class ProcessKillerApp(App):
             self.push_screen(ProcessDetailScreen(proc))
 
     def action_refresh(self) -> None:
-        self._load()
+        self.run_worker(self._load(), exclusive=True, name="load")
         self.notify("Refreshed", timeout=1.5)
 
     def action_focus_search(self) -> None:
