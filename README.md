@@ -1,6 +1,6 @@
 # Windows Process Killer
 
-> A terminal UI for scanning, understanding, and killing Windows processes — without the noise of Task Manager.
+> A fast terminal UI for scanning, understanding, and killing Windows processes — without the noise of Task Manager.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2011-0078D4?style=flat-square&logo=windows&logoColor=white)
@@ -9,30 +9,33 @@
 
 ## What it does
 
-Windows ships with ~300 background processes at any given time. Most of them are mystery `.exe` files with cryptic names. This tool:
+Windows ships with ~300 background processes at any given time. Most are mystery `.exe` files with cryptic names. This tool:
 
-- **Scans** every running process and **categorizes** it — System, Browser, Developer, Gaming, Security, Communication, Media, and more
-- **Labels** each process with a plain-English description (built-in database of 200+ known processes, falls back to reading the executable's Windows version info)
-- Lets you **kill** any process with a single keystroke — with a confirmation dialog that warns you before you kill something critical
-- Lets you **expand** any process with `E` to see its full details *and* a fetched online description, all inline
+- **Scans & categorizes** every running process — System, Browser, Developer, Gaming, Security, Communication, Media, and more
+- **Describes** each process in plain English — built-in database of 200+ known processes, falls back to reading the executable's Windows PE version info
+- **Rates kill safety** for every process — tells you whether killing is safe, risky, or actively recommended
+- **Kills** any process with a single keystroke, with a confirmation dialog that warns before touching anything critical
+- **Blocks** a process from ever restarting — detects and disables the Windows service, registry autostart entry, or scheduled task behind it
+- **Expands** any process to show full details and a live-fetched online description, all inline — no browser
 
 ---
 
 ## Screenshot
 
 ```
-┌─ Windows Process Killer ─────────────────────────────── 14:32:01 ─┐
-│ Filter by name, category, description…                 312/312      │
-├────┬──────────────────────┬──────────────┬───────────────────┬─────┤
-│PID │ Process Name         │ Category     │ Description       │ RAM │
-├────┼──────────────────────┼──────────────┼───────────────────┼─────┤
-│4424│ MemCompression       │ ⚙  System    │ Memory Compress…  │1971 │
-│2968│ bdservicehost.exe    │ 🛡  Security  │ Bitdefender Ser…  │ 467 │
-│404 │ brave.exe            │ 🌐 Browser   │ Brave Browser     │ 429 │
-│7404│ Cursor.exe           │ 💻 Developer │ Cursor — AI code… │ 391 │
-│... │ ...                  │ ...          │ ...               │ ... │
-└────┴──────────────────────┴──────────────┴───────────────────┴─────┘
- K kill   E expand   R refresh   / search   Q quit
+ Windows Process Killer ──────────────────────────────────── 14:32 ──
+ Filter by name, category, description…           100 / 307 processes
+┏━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┓
+┃ PID   ┃ Process Name             ┃ Category        ┃ Safety     ┃
+┡━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━┩
+│  4424 │ MemCompression           │ ⚙  System       │ ⛔ Risky   │
+│  2968 │ bdservicehost.exe        │ 🛡  Security     │ ⛔ Risky   │
+│   404 │ brave.exe                │ 🌐 Browser      │ ✓ Safe     │
+│  7404 │ Cursor.exe               │ 💻 Developer    │ ✓ Safe     │
+│  1882 │ epicgameslauncher.exe    │ 🎮 Gaming       │ ★ Kill it  │
+│   ... │ ...                      │ ...             │ ...        │
+└───────┴──────────────────────────┴─────────────────┴────────────┘
+ K kill   B block   E expand   R refresh   / search   Q quit
 ```
 
 ---
@@ -47,9 +50,9 @@ cd windows-killer
 run.bat
 ```
 
-That's it. `run.bat` creates a virtual environment, installs dependencies, and launches the app on first run. Subsequent runs skip straight to launch.
+`run.bat` creates a virtual environment, installs dependencies, and launches the app — both from the terminal and by double-clicking in File Explorer.
 
-> **Tip:** Right-click `run.bat` → *Run as administrator* to be able to kill protected system processes.
+> **Tip:** Right-click `run.bat` → *Run as administrator* to kill or block protected system processes.
 
 ---
 
@@ -57,88 +60,153 @@ That's it. `run.bat` creates a virtual environment, installs dependencies, and l
 
 | Key | Action |
 |-----|--------|
-| `↑` `↓` | Navigate processes |
-| `K` or `Delete` | Kill selected process (shows confirmation) |
-| `E` | Expand — shows full details + fetches live online description |
-| `R` | Full refresh (rebuild list, re-sort) |
-| `/` | Focus search bar — filter by name, category, or description |
-| `Esc` | Clear search / close panel |
+| `↑` `↓` | Navigate the process list |
+| `K` or `Delete` | Kill selected process (confirmation required) |
+| `B` | Block — kill the process and disable everything that restarts it |
+| `E` | Expand — full details + live online description fetched inline |
+| `R` | Full refresh — re-scan and rebuild the list |
+| `/` | Search — filter by name, category, description, or safety rating |
+| `Esc` | Clear search / close any open panel |
 | Click column header | Sort by that column (click again to reverse) |
 | `Q` | Quit |
 
 ---
 
+## Kill safety ratings
+
+Every process in the list gets a safety rating so you know what you're dealing with before you hit `K`.
+
+| Rating | Color | Meaning |
+|--------|-------|---------|
+| `⛔ Risky` | Red | Windows system or security process — killing may destabilize or crash |
+| `⚠ Caution` | Yellow | May lose data (open Office files, running databases, Docker containers) |
+| `✓ Safe` | Green | User application — safe to close at any time |
+| `★ Kill it` | Bright green | Known bloat — unnecessary background process actively recommended for removal |
+
+Click the **Safety** column header to sort: all `★ Kill it` processes float to the top.
+
+**Known bloat includes:** Epic Games Launcher, Steam Web Helper, NVIDIA Telemetry, Windows Compatibility Telemetry, Cortana, Office Click-to-Run updater, Xbox Game Bar, Edge WebView2 background instances, and more.
+
+---
+
+## Block (`B`) — kill and prevent restart
+
+Pressing `B` opens a panel that scans for every mechanism that could bring the process back:
+
+```
+epicgameslauncher.exe  🎮 Gaming  PID 5832
+
+Found 2 startup mechanisms:
+
+  ⚙  Windows Service — Epic Games Launcher Service
+  🔑  Registry autostart (HKCU Run): EpicGamesLauncher
+
+Kill & Block will terminate the process and disable all
+of the above so it cannot start again automatically.
+
+  Enter confirm    Esc cancel
+```
+
+What gets disabled:
+
+| Type | How | Icon |
+|------|-----|------|
+| Windows Service | `sc config ... start= disabled` | ⚙ |
+| Registry Run key | Deletes the value from `HKCU/HKLM\...\Run` | 🔑 |
+| Scheduled Task | `schtasks /Change /TN ... /DISABLE` | ⏰ |
+
+> Service and HKLM changes require Administrator. Run as admin for full blocking power.
+
+---
+
+## Expand (`E`) — live process details
+
+```
+NahimicService.exe   ❓ Other   PID 6132
+
+── Identity ─────────────────────────────────────────────
+  Description   NahimicService
+  Company       Nahimic
+  Product       NahimicService
+  Version       2.8.2.0
+
+── Location ─────────────────────────────────────────────
+  C:\Windows\System32\NahimicService.exe
+
+── Runtime ──────────────────────────────────────────────
+  User      SYSTEM
+  Started   2026-04-25 23:25:39
+  Parent    services.exe (PID 1744)
+  CPU  0.0%   RAM  12.4 MB
+
+── Online Description ───────────────────────────────────
+  nahimicservice.exe is an executable file that is part
+  of the Nahimic software, developed by A-Volute. Nahimic
+  is a technology company that specializes in 3D sound
+  software for gaming…
+```
+
+The **Online Description** fetches from DuckDuckGo's Instant Answer API and file.net simultaneously — whichever returns first wins. Local info appears instantly; the description fills in within a couple of seconds.
+
+---
+
+## How process descriptions work
+
+1. **Built-in database** — 200+ curated entries for browsers, dev tools, games, security software, Microsoft apps, communication tools, and more
+2. **Windows PE version info** — for unlisted processes, reads `FileDescription`, `CompanyName`, `ProductName`, and `FileVersion` directly from the `.exe` using the Windows version API (no external tools)
+3. **Online lookup** (Expand panel only) — DuckDuckGo Instant Answer API + file.net queried in parallel
+
+---
+
 ## Process categories
 
-| Icon | Category | Color | Examples |
-|------|----------|-------|---------|
-| ⚙ | **System** | Blue | `svchost.exe`, `explorer.exe`, `dwm.exe` |
-| 🌐 | **Browser** | Green | Chrome, Edge, Firefox, Brave |
-| 💻 | **Developer** | Cyan | VS Code, Node, Python, Docker, Git |
-| 🪟 | **Microsoft** | Blue | Word, Excel, Teams, OneDrive |
-| 🎮 | **Gaming** | Red | Steam, Epic, Discord, GeForce Experience |
-| 🛡 | **Security** | Yellow | Defender, Bitdefender, VPNs |
-| 💬 | **Communication** | Cyan | Discord, Slack, Zoom, Telegram |
-| 🎵 | **Media** | Magenta | Spotify, VLC, OBS, Adobe suite |
-| ⚡ | **Runtime** | Magenta | Java, .NET hosts |
-| ❓ | **Other** | White | Everything else |
-
-System and Security processes show dimmed names as a visual reminder that killing them may destabilize Windows.
+| Icon | Category | Examples |
+|------|----------|---------|
+| ⚙ | **System** | `svchost.exe`, `explorer.exe`, `dwm.exe`, `lsass.exe` |
+| 🌐 | **Browser** | Chrome, Edge, Firefox, Brave, Opera |
+| 💻 | **Developer** | VS Code, Node.js, Python, Docker, Git, PowerShell |
+| 🪟 | **Microsoft** | Word, Excel, Teams, OneDrive, Outlook |
+| 🎮 | **Gaming** | Steam, Epic, Valorant, GeForce Experience |
+| 🛡 | **Security** | Defender, Bitdefender, Kaspersky, VPNs, password managers |
+| 💬 | **Communication** | Discord, Slack, Zoom, Telegram, WhatsApp |
+| 🎵 | **Media** | Spotify, VLC, OBS, Photoshop, Premiere |
+| ⚡ | **Runtime** | Java (JVM), .NET host processes |
+| ❓ | **Other** | Everything else |
 
 ---
 
-## Expand panel (`E`)
+## Performance
 
-Pressing `E` on any process opens a detail panel that shows:
+The app is built to stay responsive at all times:
 
-```
-chrome.exe   🌐 Browser   PID 21888
+- **Non-blocking scan** — process enumeration runs in a background thread; the UI is never frozen
+- **Smart skip** — known system/security processes skip expensive `OpenProcess` calls that trigger Windows security audits (the main source of scan slowness on Windows)
+- **Result caching** — process categorization and PE version info are cached so repeat scans are instant
+- **Zero UI work on background refresh** — the 30-second background scan updates internal data only; no table repaints, no scroll stutter
+- **100-row cap** — the table shows the top 100 processes by RAM (the ones you actually care about); use `/` to search across all 300+
+- **Fixed column widths** — prevents Textual's layout engine from scanning all rows on every scroll event
 
-── Identity ──────────────────────────────────────────
-  Description   Google Chrome
-  Company       Google LLC
-  Product       Google Chrome
-  Version       147.0.7000.123
-
-── Location ───────────────────────────────────────────
-  C:\Program Files\Google\Chrome\Application\chrome.exe
-
-── Runtime ────────────────────────────────────────────
-  User      DESKTOP-ABC\You
-  Started   2026-04-26 09:12:34
-  Parent    explorer.exe (PID 4892)
-  CPU  0.3%   RAM  429.1 MB   Status  running
-
-── Online Description ─────────────────────────────────
-  Google Chrome is a cross-platform web browser developed
-  by Google. It was first released in 2008 for Windows …
-  — Wikipedia
-```
-
-The **Online Description** section fetches from DuckDuckGo's Instant Answer API and file.net in parallel. Local info appears instantly; the online description fills in within a few seconds.
-
----
-
-## How descriptions work
-
-1. **Built-in database** — 200+ hand-curated entries for common Windows processes, browsers, dev tools, games, security software, etc.
-2. **Windows version info** — for unlisted processes, reads the `FileDescription`, `CompanyName`, and `ProductName` fields directly from the `.exe` using the Windows PE version info API (no external tools needed).
-3. **Online lookup** (Expand panel only) — queries DuckDuckGo Instant Answer API and file.net in parallel; shows whichever returns first.
-
----
-
-## Auto-refresh
-
-The process list auto-refreshes every **5 seconds**. Only CPU% and RAM values update silently in-place — the table never jumps or rebuilds, and scrolling is never blocked. Press `R` to force a full rebuild (picks up new/exited processes and re-sorts).
+Press `R` to force a full rebuild with fresh CPU/RAM values.
 
 ---
 
 ## Dependencies
 
-| Package | Version | Purpose |
-|---------|---------|---------|
-| `psutil` | ≥ 5.9 | Process enumeration, memory/CPU stats, kill |
-| `textual` | ≥ 0.47 | Terminal UI framework |
+| Package | Purpose |
+|---------|---------|
+| `psutil` | Process enumeration, memory/CPU stats, kill, service detection |
+| `textual` | Terminal UI framework |
 
-Both install automatically via `run.bat`.
+Both install automatically on first run via `run.bat`.
 
+---
+
+## Files
+
+```
+windows-killer/
+├── main.py          # entire application (~700 lines)
+├── requirements.txt
+├── run.bat          # launcher — works from terminal and File Explorer
+└── README.md
+```
